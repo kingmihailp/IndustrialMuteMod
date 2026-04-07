@@ -1,0 +1,25 @@
+modLoader="javafml"
+loaderVersion="[47,)"
+license="MIT"
+
+[[dependencies.urlcamera]]
+    modId="forge"
+    mandatory=true
+    versionRange="[47.2,)"
+    ordering="NONE"
+    side="BOTH"
+
+[[dependencies.urlcamera]]
+    modId="minecraft"
+    mandatory=true
+    versionRange="[1.20.1,1.21)"
+    ordering="NONE"
+    side="BOTH"
+
+[[mods]]
+modId="urlcamera"
+version="1.0.0"
+displayName="URL Camera"
+description='''
+Surveillance camera mod. Place cameras and view them live through a web browser!
+'''
