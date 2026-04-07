@@ -55,6 +55,9 @@ public class CameraEntity extends Entity {
                 float yaw = getCameraYaw() + 1.0f;
                 if (yaw >= 360.0f) yaw -= 360.0f;
                 setCameraYaw(yaw);
+                // Keep yRot in sync so Camera.setup() uses the correct direction
+                // when this entity is used as the render viewpoint for FBO captures.
+                this.setYRot(yaw);
             }
         }
     }

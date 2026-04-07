@@ -7,6 +7,7 @@ import java.io.*;
 import java.net.ServerSocket;
 import java.net.Socket;
 import java.util.Map;
+import java.util.Set;
 import java.util.UUID;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.atomic.AtomicBoolean;
@@ -86,6 +87,14 @@ public class CameraWebServer {
     public static void unregisterCamera(UUID uuid) {
         cameraMetadata.remove(uuid);
         cameraFrames.remove(uuid);
+    }
+
+    public static Set<UUID> getRegisteredCameraIds() {
+        return cameraMetadata.keySet();
+    }
+
+    public static boolean hasFrame(UUID uuid) {
+        return cameraFrames.containsKey(uuid);
     }
 
     private static void handleClient(Socket socket) {
