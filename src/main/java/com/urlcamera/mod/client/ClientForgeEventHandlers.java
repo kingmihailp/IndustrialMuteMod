@@ -1,13 +1,11 @@
 package com.urlcamera.mod.client;
 
+import com.mojang.blaze3d.pipeline.RenderTarget;
 import com.mojang.blaze3d.platform.NativeImage;
 import com.mojang.blaze3d.systems.RenderSystem;
-import com.mojang.blaze3d.vertex.PoseStack;
 import com.urlcamera.mod.entity.CameraEntity;
 import com.urlcamera.mod.server.CameraWebServer;
 import net.minecraft.client.Minecraft;
-import com.mojang.blaze3d.pipeline.RenderTarget;
-import com.mojang.blaze3d.pipeline.TextureTarget;
 import net.minecraft.world.entity.Entity;
 import net.minecraftforge.api.distmarker.Dist;
 import net.minecraftforge.event.TickEvent;
@@ -15,40 +13,38 @@ import net.minecraftforge.eventbus.api.SubscribeEvent;
 import net.minecraftforge.fml.common.Mod;
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
-import org.lwjgl.opengl.GL11;
 
 import javax.imageio.ImageIO;
 import java.awt.image.BufferedImage;
 import java.io.ByteArrayOutputStream;
 import java.util.ArrayList;
 import java.util.List;
-import java.util.Map;
 import java.util.UUID;
-import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
 
 @Mod.EventBusSubscriber(modid = "urlcamera", value = Dist.CLIENT, bus = Mod.EventBusSubscriber.Bus.FORGE)
 public class ClientForgeEventHandlers {
 
     private static final Logger LOGGER = LogManager.getLogger("urlcamera/client-forge");
 
-    // --- FBO-based per-camera rendering ---
-    private static final Map<UUID, Long> lastFboCapture = new ConcurrentHashMap<>();
-    /** How often to render each camera's FBO (ms). Higher = cheaper. */
-    private static final long FBO_INTERVAL_MS = 500; // ~2 fps per camera
+    /** JPEG encoding is CPU-heavy; keep it off the render thread. */
+    private static final ExecutorService JPEG_POOL = Executors.newSingleThreadExecutor(r -> {
+        Thread t = new Thread(r, "urlcamera-jpeg");
+        t.setDaemon(true);
+        return t;
+    });
+
     private static final int CAPTURE_W = 640;
     private static final int CAPTURE_H = 360;
-    /** Single shared off-screen render target reused across cameras. */
-    private static RenderTarget cameraFBO = null;
+    private static final long CAPTURE_INTERVAL_MS = 100; // max 10 fps
+    private static long lastCapture = 0;
+    private static boolean encodeInFlight = false; // don't queue faster than we encode
 
-    // --- Fallback: capture the main framebuffer ---
-    private static long lastFallbackCapture = 0;
-    private static final long FALLBACK_INTERVAL_MS = 100; // 10 fps
-
-    // For registering / unregistering cameras in the web server
     private static final List<UUID> registeredCameraIds = new ArrayList<>();
 
     // -------------------------------------------------------------------------
-    // ClientTickEvent – keep the web-server's camera list in sync
+    // Keep the web-server's camera list in sync with loaded entities
     // -------------------------------------------------------------------------
     @SubscribeEvent
     public static void onClientTick(TickEvent.ClientTickEvent event) {
@@ -62,13 +58,9 @@ public class ClientForgeEventHandlers {
             if (!(entity instanceof CameraEntity camera)) continue;
             UUID uuid = camera.getUUID();
             currentCameras.add(uuid);
-
             String mode = camera.getRotationMode() == CameraEntity.MODE_ROTATING ? "ROTATING" : "STATIONARY";
             CameraWebServer.registerCamera(uuid, camera.getX(), camera.getY(), camera.getZ(), mode);
-
-            if (!registeredCameraIds.contains(uuid)) {
-                registeredCameraIds.add(uuid);
-            }
+            if (!registeredCameraIds.contains(uuid)) registeredCameraIds.add(uuid);
         }
 
         List<UUID> toRemove = new ArrayList<>();
@@ -82,129 +74,38 @@ public class ClientForgeEventHandlers {
     }
 
     // -------------------------------------------------------------------------
-    // RenderTickEvent – two phases
+    // After each rendered frame: grab the framebuffer and push to all cameras.
+    // Heavy JPEG encoding is offloaded to a background thread so the render
+    // thread is never blocked.
     // -------------------------------------------------------------------------
     @SubscribeEvent
     public static void onRenderTick(TickEvent.RenderTickEvent event) {
+        if (event.phase != TickEvent.Phase.END) return;
+
         Minecraft mc = Minecraft.getInstance();
         if (mc.level == null || mc.player == null) return;
         if (CameraWebServer.getRegisteredCameraIds().isEmpty()) return;
 
-        if (event.phase == TickEvent.Phase.START) {
-            // ---- Phase START: FBO renders BEFORE the main scene ----
-            // We bind our own FBO, call renderLevel() with camera entity as the viewpoint,
-            // then restore the main render target so the normal game render is unaffected.
-            long now = System.currentTimeMillis();
+        long now = System.currentTimeMillis();
+        if (now - lastCapture < CAPTURE_INTERVAL_MS) return;
+        if (encodeInFlight) return; // previous frame not done yet – skip
+        lastCapture = now;
 
-            // Snapshot the entity list to avoid CME
-            List<CameraEntity> cameras = new ArrayList<>();
-            for (Entity e : mc.level.entitiesForRendering()) {
-                if (e instanceof CameraEntity cam) cameras.add(cam);
-            }
+        RenderTarget target = mc.getMainRenderTarget();
+        if (target == null || target.width <= 0 || target.height <= 0) return;
 
-            for (CameraEntity camera : cameras) {
-                UUID id = camera.getUUID();
-                if (now - lastFboCapture.getOrDefault(id, 0L) < FBO_INTERVAL_MS) continue;
-                lastFboCapture.put(id, now);
-                renderCameraToFBO(mc, camera, id);
-            }
-
-            // Always restore the main render target before the game renders its frame
-            mc.getMainRenderTarget().bindWrite(true);
-
-        } else if (event.phase == TickEvent.Phase.END) {
-            // ---- Phase END: fallback – send the current game view ----
-            // Cameras that still have no FBO frame receive the player's current view
-            // so the stream is never empty.
-            long now = System.currentTimeMillis();
-            if (now - lastFallbackCapture < FALLBACK_INTERVAL_MS) return;
-            lastFallbackCapture = now;
-
-            try {
-                byte[] jpeg = captureFromTarget(mc.getMainRenderTarget());
-                if (jpeg == null) return;
-
-                UUID activeId = CameraViewManager.getActiveCameraId();
-                if (activeId != null) {
-                    // Player entered camera-view mode → current render IS the camera view
-                    CameraWebServer.updateFrame(activeId, jpeg);
-                } else {
-                    // No camera-view mode – push player view to every camera that has no
-                    // FBO frame yet, so the stream starts immediately on page load.
-                    for (UUID id : new ArrayList<>(CameraWebServer.getRegisteredCameraIds())) {
-                        if (!CameraWebServer.hasFrame(id)) {
-                            CameraWebServer.updateFrame(id, jpeg);
-                        }
-                    }
-                }
-            } catch (Exception e) {
-                LOGGER.debug("[URL Camera] Fallback capture error: {}", e.getMessage());
-            }
-        }
-    }
-
-    // -------------------------------------------------------------------------
-    // FBO rendering: render the world from the camera entity's perspective
-    // -------------------------------------------------------------------------
-    private static void renderCameraToFBO(Minecraft mc, CameraEntity camera, UUID cameraId) {
-        try {
-            // Lazily create a shared off-screen render target
-            if (cameraFBO == null) {
-                cameraFBO = new TextureTarget(CAPTURE_W, CAPTURE_H, true, Minecraft.ON_OSX);
-            }
-
-            Entity prevCamera = mc.getCameraEntity();
-            RenderTarget mainTarget = mc.getMainRenderTarget();
-
-            // Point the engine camera at this camera entity
-            mc.setCameraEntity(camera);
-
-            // Bind our off-screen FBO and clear it
-            cameraFBO.bindWrite(true);
-            RenderSystem.clearColor(0.1f, 0.1f, 0.1f, 1.0f);
-            RenderSystem.clear(GL11.GL_COLOR_BUFFER_BIT | GL11.GL_DEPTH_BUFFER_BIT, Minecraft.ON_OSX);
-
-            // Render the world to our FBO from the camera's viewpoint.
-            // partialTick = 0 (full-tick accuracy is fine for a surveillance feed).
-            // Give it a generous deadline so it doesn't cut corners.
-            mc.gameRenderer.renderLevel(0f, System.nanoTime() + 100_000_000L, new PoseStack());
-
-            // Download pixels and encode as JPEG
-            byte[] jpeg = captureFromTarget(cameraFBO);
-            if (jpeg != null) {
-                CameraWebServer.updateFrame(cameraId, jpeg);
-            }
-
-            // Restore the engine camera and main render target
-            mc.setCameraEntity(prevCamera);
-            mainTarget.bindWrite(true);
-
-        } catch (Exception e) {
-            // FBO render can fail (e.g. during world load); log at debug level only
-            LOGGER.debug("[URL Camera] FBO render failed for {}: {}", cameraId, e.getMessage());
-        }
-    }
-
-    // -------------------------------------------------------------------------
-    // Pixel capture: download a render target's colour texture and encode JPEG
-    // -------------------------------------------------------------------------
-    private static byte[] captureFromTarget(RenderTarget target) {
-        if (target == null) return null;
+        // ----- Render-thread work: download GPU pixels into a Java int[] -----
         int srcW = target.width;
         int srcH = target.height;
-        if (srcW <= 0 || srcH <= 0) return null;
+        int[] pixels = new int[CAPTURE_W * CAPTURE_H];
 
         try (NativeImage img = new NativeImage(srcW, srcH, false)) {
-            // downloadTexture reads from the texture currently bound to GL_TEXTURE_2D
             RenderSystem.bindTexture(target.getColorTextureId());
             img.downloadTexture(0, false);
-            // OpenGL stores textures with Y=0 at the bottom; flip so Y=0 is the top
-            img.flipY();
+            img.flipY(); // OpenGL Y=0 is bottom; flip so Y=0 is top
 
-            BufferedImage out = new BufferedImage(CAPTURE_W, CAPTURE_H, BufferedImage.TYPE_INT_RGB);
             float sx = (float) srcW / CAPTURE_W;
             float sy = (float) srcH / CAPTURE_H;
-
             for (int py = 0; py < CAPTURE_H; py++) {
                 int iy = Math.min((int) (py * sy), srcH - 1);
                 for (int px = 0; px < CAPTURE_W; px++) {
@@ -214,17 +115,34 @@ public class ClientForgeEventHandlers {
                     int r = rgba & 0xFF;
                     int g = (rgba >> 8) & 0xFF;
                     int b = (rgba >> 16) & 0xFF;
-                    out.setRGB(px, py, (r << 16) | (g << 8) | b);
+                    pixels[py * CAPTURE_W + px] = (r << 16) | (g << 8) | b;
                 }
             }
-
-            ByteArrayOutputStream baos = new ByteArrayOutputStream(65536);
-            ImageIO.write(out, "jpg", baos);
-            return baos.toByteArray();
-
         } catch (Exception e) {
-            LOGGER.debug("[URL Camera] captureFromTarget error: {}", e.getMessage());
-            return null;
+            LOGGER.debug("[URL Camera] Pixel download error: {}", e.getMessage());
+            return;
         }
+
+        // ----- Background thread: encode JPEG and push to every camera -----
+        List<UUID> ids = new ArrayList<>(CameraWebServer.getRegisteredCameraIds());
+        encodeInFlight = true;
+        JPEG_POOL.submit(() -> {
+            try {
+                BufferedImage img = new BufferedImage(CAPTURE_W, CAPTURE_H, BufferedImage.TYPE_INT_RGB);
+                img.setRGB(0, 0, CAPTURE_W, CAPTURE_H, pixels, 0, CAPTURE_W);
+
+                ByteArrayOutputStream baos = new ByteArrayOutputStream(65536);
+                ImageIO.write(img, "jpg", baos);
+                byte[] jpeg = baos.toByteArray();
+
+                for (UUID id : ids) {
+                    CameraWebServer.updateFrame(id, jpeg);
+                }
+            } catch (Exception e) {
+                LOGGER.debug("[URL Camera] JPEG encode error: {}", e.getMessage());
+            } finally {
+                encodeInFlight = false;
+            }
+        });
     }
 }

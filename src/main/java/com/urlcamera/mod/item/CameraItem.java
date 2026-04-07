@@ -1,7 +1,6 @@
 package com.urlcamera.mod.item;
 
 import com.urlcamera.mod.entity.CameraEntity;
-import net.minecraft.core.Direction;
 import net.minecraft.network.chat.ClickEvent;
 import net.minecraft.network.chat.Component;
 import net.minecraft.network.chat.Style;
@@ -32,20 +31,9 @@ public class CameraItem extends Item {
         double y = blockPos.getY() + 0.5 + face.getStepY() * 0.35;
         double z = blockPos.getZ() + 0.5 + face.getStepZ() * 0.35;
 
-        float yaw = switch (face) {
-            case NORTH -> 180f;
-            case SOUTH -> 0f;
-            case WEST -> 90f;
-            case EAST -> -90f;
-            case UP -> player.getYRot();
-            case DOWN -> player.getYRot();
-        };
-
-        float pitch = switch (face) {
-            case UP -> -90f;
-            case DOWN -> 90f;
-            default -> 0f;
-        };
+        // Camera looks in the same direction the player is facing when placing it
+        float yaw   = player.getYRot();
+        float pitch = player.getXRot();
 
         if (!level.isClientSide) {
             CameraEntity camera = new CameraEntity(level);
