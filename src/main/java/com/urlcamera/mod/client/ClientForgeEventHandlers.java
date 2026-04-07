@@ -6,7 +6,8 @@ import com.mojang.blaze3d.vertex.PoseStack;
 import com.urlcamera.mod.entity.CameraEntity;
 import com.urlcamera.mod.server.CameraWebServer;
 import net.minecraft.client.Minecraft;
-import net.minecraft.client.renderer.RenderTarget;
+import com.mojang.blaze3d.pipeline.RenderTarget;
+import com.mojang.blaze3d.pipeline.TextureTarget;
 import net.minecraft.world.entity.Entity;
 import net.minecraftforge.api.distmarker.Dist;
 import net.minecraftforge.event.TickEvent;
@@ -149,8 +150,7 @@ public class ClientForgeEventHandlers {
         try {
             // Lazily create a shared off-screen render target
             if (cameraFBO == null) {
-                cameraFBO = new RenderTarget(true);
-                cameraFBO.createBuffers(CAPTURE_W, CAPTURE_H, Minecraft.ON_OSX);
+                cameraFBO = new TextureTarget(CAPTURE_W, CAPTURE_H, true, Minecraft.ON_OSX);
             }
 
             Entity prevCamera = mc.getCameraEntity();
