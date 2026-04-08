@@ -1,6 +1,7 @@
 package com.urlcamera.mod.item;
 
 import com.urlcamera.mod.entity.CameraEntity;
+import net.minecraft.core.Direction;
 import net.minecraft.network.chat.ClickEvent;
 import net.minecraft.network.chat.Component;
 import net.minecraft.network.chat.Style;
